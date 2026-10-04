@@ -37,6 +37,7 @@
     validateSnapshot,
   } from '$lib/utils/export';
   import type { SealCarveSnapshot } from '$lib/utils/db';
+  import { push, ROUTES } from '$lib/router';
 
   // 印谱条目没有独立 store：本页通过 useIdbTable 的 liveQuery 订阅并完成全部读写
   const catalogTable = useIdbTable<Catalog>((database) => database.catalogs, { sortByUpdatedAt: false });
@@ -202,6 +203,7 @@
       </p>
     </div>
     <div class="flex flex-wrap gap-2">
+      <button class="gb-btn" onclick={() => push(ROUTES.album)}>册页排布 →</button>
       <button class="gb-btn" onclick={() => void handleExport()}>导出 JSON</button>
       <button class="gb-btn" onclick={() => fileInput?.click()}>导入 JSON</button>
       <button class="gb-btn-danger" onclick={() => void handleReset()}>清空重播种</button>

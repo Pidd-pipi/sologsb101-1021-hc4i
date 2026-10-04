@@ -59,6 +59,13 @@ npm run build      # 类型检查 + 生产构建，产物在 frontend/dist
 npm run preview    # 本地预览构建产物（http://localhost:22821）
 ```
 
+册页排布引擎的纯逻辑测试（分页 / 续册 / 页码沿用，无需浏览器）：
+
+```bash
+cd frontend
+node run-album-tests.mjs   # 通过 esbuild 打包 scripts/test-album-layout.ts 后用 node 执行
+```
+
 要求 Node.js 20 及以上（与 Docker 构建阶段镜像 `node:20-alpine` 保持一致）。
 
 ---
@@ -72,6 +79,7 @@ npm run preview    # 本地预览构建产物（http://localhost:22821）
 | `/#/carve` | 刻制工序看板 | 按印稿列出刀法步骤、拖拽或上下移排序、批量完成；全部完成回写印石为「已刻」 | Carve、Design |
 | `/#/impressions` | 钤印登记与效果比对 | 同稿多枚并列展示印泥、纸张、压力与评级，按评级择优并一键回填采用稿效果 | Impression、Design |
 | `/#/catalog` | 印谱汇总与导出 | 排序重编号、收录状态切换、印谱清单生成、JSON 导入导出与清空重播种 | Catalog 及全部模型 |
+| `/#/album` | 册页排布与分册 | 纸张/页边距/形制决定每页容量，条目不跨页、装不下续册；目录页码与总册数联动重算，已校对页沿用原页码，保存失败回滚可重试 | Catalog、Design、Stone、AlbumLayout |
 
 未知路径由 `routes/NotFound.svelte` 给出友好空态（不白屏）。筛选条件写入 hash query（`?kw=&stoneType=&knobStyle=` 等），刷新后可完整还原。
 
@@ -86,8 +94,19 @@ npm run preview    # 本地预览构建产物（http://localhost:22821）
 | Carve 刻制工序 | `src/lib/types/carve.ts` | `id` `designId` `seq` `knifeMethod`（冲刀/切刀/双刀/修整） `minutes` `operator` `state`（未开始/进行中/已完成） | 拖拽调序，全部完成即回写印石为已刻 |
 | Impression 钤印记录 | `src/lib/types/impression.ts` | `id` `designId` `inkBrand` `paperType`（连史纸/宣纸/罗纹纸） `pressure`（轻/中/重） `grade`（优/良/一般/废） `stampedAt` | 同稿多次钤印按评级排序择优，可一键回填采用稿效果 |
 | Catalog 印谱条目 | `src/lib/types/catalog.ts` | `id` `stoneId` `designId` `orderNo` `included`（待收录/已收录/不收录） `note` | 调整排序后自动重编号并汇总已收录方数 |
+| AlbumLayout 册页排布 | `src/lib/types/album.ts` | 单例记录 `id='default'` `layoutVersion` `settings`（纸宽/纸高/页边距/间距/款识栏/每册页数）`pages[]`（`pageNo`/`catalogIds`/`proofread`） | 已收录条目按版面参数贪心分页、按每册页数续册；只持久化页码与条目 id 序列，坐标与目录随时重算 |
 
-数据结构版本号 `DB_VERSION` 定义在 `src/lib/utils/db.ts`，当前为 `v2`：`v1` 为初版五表结构；`v2` 补充 `stones.purchaseDate`、`designs.borderStyle`、`carves.operator`、`impressions.paperType`、`catalogs.included` 等索引，并在 Dexie `.upgrade()` 中回填历史记录缺失字段（`grade`、`adopted`、`borderStyle`、`orderNo`、`included`、`note`）。
+数据结构版本号 `DB_VERSION` 定义在 `src/lib/utils/db.ts`，当前为 `v3`：`v1` 为初版五表结构；`v2` 补充 `stones.purchaseDate`、`designs.borderStyle`、`carves.operator`、`impressions.paperType`、`catalogs.included` 等索引，并在 Dexie `.upgrade()` 中回填历史记录缺失字段（`grade`、`adopted`、`borderStyle`、`orderNo`、`included`、`note`）；`v3` 新增 `albumLayouts` 册页排布单例表，旧库升级时补一份默认空排布。
+
+**册页排布规则**（引擎 `src/lib/utils/albumLayout.ts`，纯函数并附 `scripts/test-album-layout.ts` 逻辑测试）：
+
+- **每页容量**：版心 = 纸张 − 两侧页边距；一方印按「印面尺寸 + 形制边距（双边/瓦当多留边）+ 款识释文栏」占位，自上而下堆叠。
+- **条目不跨页**：当前页剩余高度放不下整方时，整方移到下一页；单方比整页版心还大则独占一页并标记溢出（提示换大纸或缩小边距）。
+- **续册**：按「每册页数」把全局连续页装订成册，超出即续新册，总册数随页数自动变化。
+- **目录页码联动**：收录、撤下或换序后重新分页，目录中每方的「册号 / 全局页码 / 册内页码」与总册数一起重算。
+- **已校对沿用**：页内条目 id 序列与上一版一致（内容前缀未断）且已校对的页沿用原页码；内容或顺序在某页变化后，该页及其后续顺延，未变化的已校对前缀保持页码不动；取消某页校对不会中断内容前缀。
+- **保存失败回滚**：写入 IndexedDB 失败时内存恢复到上一版排布并保留待重试方案，可一键重试；也可「放弃改动」恢复已保存版本。
+- **旧备份补齐**：导入缺少排布信息的旧备份（或记录字段残缺）时，先规范化补齐默认空排布再分册，不影响原有五表数据。
 
 ---
 
@@ -98,17 +117,18 @@ sologsb101-1021/
 ├── frontend/                     # 前端源码
 │   ├── src/
 │   │   ├── lib/
-│   │   │   ├── types/            # stone.ts design.ts carve.ts impression.ts catalog.ts
-│   │   │   ├── stores/           # stoneStore.ts designStore.ts carveStore.ts impressionStore.ts
+│   │   │   ├── types/            # stone.ts design.ts carve.ts impression.ts catalog.ts album.ts
+│   │   │   ├── stores/           # stoneStore.ts designStore.ts carveStore.ts impressionStore.ts albumStore.ts
 │   │   │   ├── components/common/# GradeTag.svelte FilterBar.svelte StatBadge.svelte EmptyPanel.svelte
 │   │   │   ├── hooks/            # useCarveProgress.ts useIdbTable.ts
-│   │   │   ├── utils/            # stone.ts db.ts export.ts
+│   │   │   ├── utils/            # stone.ts db.ts export.ts albumLayout.ts
 │   │   │   └── router/           # index.ts（路由表 + 导航项）
 │   │   ├── routes/               # stones/+page.svelte designs/+page.svelte carve/+page.svelte
-│   │   │                         # impressions/+page.svelte catalog/+page.svelte NotFound.svelte
+│   │   │                         # impressions/+page.svelte catalog/+page.svelte album/+page.svelte NotFound.svelte
 │   │   ├── App.svelte            # 应用外壳（导航 + 首屏初始化）
 │   │   ├── main.js main.ts       # 入口：main.js 引用 main.ts 的 bootstrap()
 │   │   └── app.css               # Tailwind 入口 + 基础层 / 组件层
+│   ├── scripts/                  # test-album-layout.ts（册页排布引擎纯逻辑测试）
 │   ├── public/favicon.svg
 │   ├── index.html package.json tsconfig.json vite.config.ts
 │   ├── svelte.config.js tailwind.config.js postcss.config.js
@@ -127,9 +147,9 @@ sologsb101-1021/
 
 ## 七、数据存储说明
 
-- **IndexedDB（Dexie，数据库名 `gbsealcarve`）**：5 张业务表 `stones` / `designs` / `carves` / `impressions` / `catalogs`，由 `src/lib/utils/db.ts` 统一定义 schema、版本号与升级迁移；`initDatabase()` 首次打开时自动播种**三层互相引用**的演示数据（Stone → Design → Carve / Impression，另有 Stone → Catalog，固定 id 如 `stone_01`、`design_0101`、`carve_010101`），播种幂等，保证每个页面打开都有内容。
+- **IndexedDB（Dexie，数据库名 `gbsealcarve`）**：5 张业务表 `stones` / `designs` / `carves` / `impressions` / `catalogs`，外加 `albumLayouts` 册页排布单例表，由 `src/lib/utils/db.ts` 统一定义 schema、版本号与升级迁移；`initDatabase()` 首次打开时自动播种**三层互相引用**的演示数据（Stone → Design → Carve / Impression，另有 Stone → Catalog，固定 id 如 `stone_01`、`design_0101`、`carve_010101`），播种幂等，保证每个页面打开都有内容。
 - **localStorage**：仅存元数据 —— `gbsealcarve:db-version`（本地结构版本）、`gbsealcarve:last-backup-at`（最近导出时间）、`gbsealcarve:ui-prefs`（当前印石 / 印稿）。
-- **备份**：`/catalog` 页可导出 JSON（5 张表全量数据 + 结构版本号），导入时校验 `app` 字段与各集合数组完整性，覆盖导入前二次确认；另有印谱清单 TXT 与钤印台账 CSV。
+- **备份**：`/catalog` 页可导出 JSON（业务表 + `albumLayouts` 排布 + 结构版本号），导入时校验 `app` 字段与各业务集合完整性，覆盖导入前二次确认；旧备份缺少排布信息时先补齐默认空排布再分册。另有印谱清单 TXT、册页排布 TXT 与钤印台账 CSV。
 - **隐私与无状态**：数据不上传任何服务器，容器不挂载命名卷；清理浏览器站点数据或更换浏览器会丢失档案，请定期导出备份。
 
 ---

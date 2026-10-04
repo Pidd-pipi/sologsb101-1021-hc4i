@@ -10,6 +10,7 @@ import DesignsPage from '../../routes/designs/+page.svelte';
 import CarvePage from '../../routes/carve/+page.svelte';
 import ImpressionsPage from '../../routes/impressions/+page.svelte';
 import CatalogPage from '../../routes/catalog/+page.svelte';
+import AlbumPage from '../../routes/album/+page.svelte';
 import NotFoundPage from '../../routes/NotFound.svelte';
 
 export const routes: Record<string, Component> = {
@@ -19,6 +20,7 @@ export const routes: Record<string, Component> = {
   [ROUTES.carve]: CarvePage,
   [ROUTES.impressions]: ImpressionsPage,
   [ROUTES.catalog]: CatalogPage,
+  [ROUTES.album]: AlbumPage,
   '*': NotFoundPage
 };
 

@@ -12,6 +12,7 @@ import { DESIGN_STYLE_LABEL, BORDER_STYLE_LABEL } from '$lib/types/design';
 import { GRADE_LABEL, PAPER_KIND_LABEL, PRESSURE_LABEL } from '$lib/types/impression';
 import { INCLUDED_LABEL } from '$lib/types/catalog';
 import { KNIFE_METHOD_LABEL, CARVE_STATE_LABEL } from '$lib/types/carve';
+import type { AlbumLayout } from '$lib/types/album';
 import { describeSize } from './stone';
 import type { SealCarveSnapshot } from './db';
 
@@ -164,4 +165,44 @@ export async function copyText(text: string): Promise<boolean> {
     return false;
   }
   return false;
+}
+
+/** 册页排布文本：分册页码 + 每页条目 + 目录页码（与总册数） */
+export function buildAlbumText(layout: AlbumLayout): string {
+  const { settings } = layout;
+  const lines: string[] = [
+    '篆刻印谱册页排布',
+    `生成时间：${new Date().toLocaleString('zh-CN')}`,
+    `纸张：${settings.paperWidthMm}×${settings.paperHeightMm} mm　页边距：${settings.marginMm} mm　每册 ${settings.pagesPerBook} 页`,
+    `共 ${layout.bookCount} 册 ${layout.pageCount} 页，收录 ${layout.entryCount} 方；沿用原页码 ${layout.lockedPageCount} 页`,
+    '',
+  ];
+
+  layout.books.forEach((book) => {
+    lines.push(`【第 ${book.bookNo} 册】第 ${book.pageNoStart}–${book.pageNoEnd} 页（共 ${book.pages.length} 页）`);
+    book.pages.forEach((page) => {
+      const sealTexts = page.entries.map((entry) => `${entry.orderNo}.${entry.sealText}`).join('　');
+      const tag = page.locked ? '（已校对·沿用原页码）' : '';
+      lines.push(`　第 ${page.pageNo} 页${tag}：${sealTexts || '（空页）'}`);
+    });
+    lines.push('');
+  });
+
+  lines.push('目录');
+  layout.toc.forEach((row) => {
+    lines.push(`　第 ${row.orderNo} 方　${row.sealText}　……　第 ${row.bookNo} 册 第 ${row.pageNo} 页（册内第 ${row.pageInBook} 页）`);
+  });
+
+  if (layout.overflowCatalogIds.length > 0) {
+    lines.push('');
+    lines.push(`提示：有 ${layout.overflowCatalogIds.length} 方印蜕比整页版心还大，已独占页；建议换大纸或缩小页边距。`);
+  }
+  return lines.join('\n');
+}
+
+/** 导出册页排布为文本文件，返回文件名 */
+export function exportAlbumText(layout: AlbumLayout): string {
+  const filename = `篆刻册页排布-${stampSuffix()}.txt`;
+  download(filename, buildAlbumText(layout), 'text/plain;charset=utf-8');
+  return filename;
 }

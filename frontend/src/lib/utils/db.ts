@@ -12,12 +12,19 @@ import type { Design } from '$lib/types/design';
 import type { Carve } from '$lib/types/carve';
 import type { Impression } from '$lib/types/impression';
 import type { Catalog } from '$lib/types/catalog';
+import {
+  ALBUM_LAYOUT_RECORD_ID,
+  ALBUM_LAYOUT_VERSION,
+  createEmptyLayoutRecord,
+  DEFAULT_ALBUM_SETTINGS,
+  type AlbumLayoutRecord,
+} from '$lib/types/album';
 
 /** 数据库名（README 与导出文件均使用该名称） */
 export const DB_NAME = 'gbsealcarve';
 
 /** 当前数据结构版本号 */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** localStorage 侧少量元数据键 */
 export const LS_KEYS = {
@@ -85,6 +92,7 @@ class SealCarveDatabase extends Dexie {
   carves!: Table<Carve, string>;
   impressions!: Table<Impression, string>;
   catalogs!: Table<Catalog, string>;
+  albumLayouts!: Table<AlbumLayoutRecord, string>;
 
   constructor() {
     super(DB_NAME);
@@ -99,7 +107,7 @@ class SealCarveDatabase extends Dexie {
     });
 
     // v2：补充检索索引并回填历史记录缺失字段
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         stones: 'id, name, stoneType, knobStyle, state, purchaseDate, updatedAt',
         designs: 'id, stoneId, style, borderStyle, adopted, updatedAt',
@@ -131,6 +139,24 @@ class SealCarveDatabase extends Dexie {
             if (!catalog.included) catalog.included = 'pending';
           });
       });
+
+    // v3：新增册页排布单例表（旧库没有排布信息，升级时补一份空排布）
+    this.version(DB_VERSION)
+      .stores({
+        stones: 'id, name, stoneType, knobStyle, state, purchaseDate, updatedAt',
+        designs: 'id, stoneId, style, borderStyle, adopted, updatedAt',
+        carves: 'id, designId, seq, knifeMethod, operator, state, updatedAt',
+        impressions: 'id, designId, grade, paperType, stampedAt, updatedAt',
+        catalogs: 'id, stoneId, designId, orderNo, included, updatedAt',
+        albumLayouts: 'id, layoutVersion, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        const albumTable = tx.table<AlbumLayoutRecord>('albumLayouts');
+        const existing = await albumTable.get(ALBUM_LAYOUT_RECORD_ID);
+        if (!existing) {
+          await albumTable.add(createEmptyLayoutRecord({ ...DEFAULT_ALBUM_SETTINGS }));
+        }
+      });
   }
 }
 
@@ -148,6 +174,11 @@ export async function initDatabase(): Promise<void> {
   stampDbVersion();
   if ((await db.stones.count()) === 0) {
     await seedDatabase();
+  }
+  // 任何路径打开后都保证排布单例存在（旧备份 / 手工清表后补齐再分册）
+  const existingLayout = await db.albumLayouts.get(ALBUM_LAYOUT_RECORD_ID);
+  if (!existingLayout) {
+    await db.albumLayouts.put(createEmptyLayoutRecord({ ...DEFAULT_ALBUM_SETTINGS }));
   }
 }
 
@@ -241,13 +272,21 @@ export async function seedDatabase(): Promise<void> {
     { id: 'cata_0401', stoneId: 'stone_04', designId: 'design_0401', orderNo: 4, included: 'excluded', note: '此稿暂不收录，另拟新稿', createdAt: now - day * 10, updatedAt: now - day * 2 },
   ];
 
-  await db.transaction('rw', [db.stones, db.designs, db.carves, db.impressions, db.catalogs], async () => {
-    await db.stones.bulkPut(stones);
-    await db.designs.bulkPut(designs);
-    await db.carves.bulkPut(carves);
-    await db.impressions.bulkPut(impressions);
-    await db.catalogs.bulkPut(catalogs);
-  });
+  await db.transaction(
+    'rw',
+    [db.stones, db.designs, db.carves, db.impressions, db.catalogs, db.albumLayouts],
+    async () => {
+      await db.stones.bulkPut(stones);
+      await db.designs.bulkPut(designs);
+      await db.carves.bulkPut(carves);
+      await db.impressions.bulkPut(impressions);
+      await db.catalogs.bulkPut(catalogs);
+      // 演示库附带默认册页设置（尚无已校对页，首次排布时全量分页）
+      if (!(await db.albumLayouts.get(ALBUM_LAYOUT_RECORD_ID))) {
+        await db.albumLayouts.put(createEmptyLayoutRecord({ ...DEFAULT_ALBUM_SETTINGS }, now));
+      }
+    },
+  );
 }
 
 /* ------------------------------ 整库导入导出 ------------------------------ */
@@ -261,15 +300,18 @@ export interface SealCarveSnapshot {
   carves: Carve[];
   impressions: Impression[];
   catalogs: Catalog[];
+  /** v3 起附带册页排布；旧备份缺失时导入前先补齐 */
+  albumLayouts?: AlbumLayoutRecord[];
 }
 
 export async function exportSnapshot(): Promise<SealCarveSnapshot> {
-  const [stones, designs, carves, impressions, catalogs] = await Promise.all([
+  const [stones, designs, carves, impressions, catalogs, albumLayouts] = await Promise.all([
     db.stones.toArray(),
     db.designs.toArray(),
     db.carves.toArray(),
     db.impressions.toArray(),
     db.catalogs.toArray(),
+    db.albumLayouts.toArray(),
   ]);
   return {
     app: DB_NAME,
@@ -280,6 +322,7 @@ export async function exportSnapshot(): Promise<SealCarveSnapshot> {
     carves,
     impressions,
     catalogs,
+    albumLayouts,
   };
 }
 
@@ -295,27 +338,89 @@ export function validateSnapshot(input: unknown): string {
   return '';
 }
 
+/**
+ * 旧备份补齐：没有 albumLayouts 集合（或缺少单例记录）时，补一份默认空排布。
+ * 返回补齐后的记录数组；同时把残缺记录（缺字段 / 版本号异常）规范化。
+ */
+export function ensureAlbumLayoutInSnapshot(snapshot: SealCarveSnapshot): AlbumLayoutRecord[] {
+  const now = Date.now();
+  const raw = Array.isArray(snapshot.albumLayouts) ? snapshot.albumLayouts : [];
+  let record = raw.find((item) => item?.id === ALBUM_LAYOUT_RECORD_ID);
+  if (!record) {
+    record = createEmptyLayoutRecord({ ...DEFAULT_ALBUM_SETTINGS }, now);
+  } else {
+    record = normalizeLayoutRecord(record, now);
+  }
+  return [record];
+}
+
+/** 把任意历史排布记录规范化为当前结构（缺排布信息时先补齐再分册） */
+export function normalizeLayoutRecord(record: AlbumLayoutRecord, now: number = Date.now()): AlbumLayoutRecord {
+  const settings = record.settings ?? { ...DEFAULT_ALBUM_SETTINGS };
+  return {
+    id: ALBUM_LAYOUT_RECORD_ID,
+    layoutVersion: ALBUM_LAYOUT_VERSION,
+    settings: {
+      paperWidthMm: positiveNumber(settings.paperWidthMm, DEFAULT_ALBUM_SETTINGS.paperWidthMm),
+      paperHeightMm: positiveNumber(settings.paperHeightMm, DEFAULT_ALBUM_SETTINGS.paperHeightMm),
+      marginMm: nonNegativeNumber(settings.marginMm, DEFAULT_ALBUM_SETTINGS.marginMm),
+      gapMm: nonNegativeNumber(settings.gapMm, DEFAULT_ALBUM_SETTINGS.gapMm),
+      annotationMm: nonNegativeNumber(settings.annotationMm, DEFAULT_ALBUM_SETTINGS.annotationMm),
+      pagesPerBook: positiveNumber(settings.pagesPerBook, DEFAULT_ALBUM_SETTINGS.pagesPerBook),
+    },
+    pages: Array.isArray(record.pages)
+      ? record.pages
+          .filter((page) => page && Array.isArray(page.catalogIds))
+          .map((page, index) => ({
+            pageNo: typeof page.pageNo === 'number' && page.pageNo > 0 ? page.pageNo : index + 1,
+            catalogIds: page.catalogIds.filter((id): id is string => typeof id === 'string'),
+            proofread: page.proofread === true,
+          }))
+      : [],
+    updatedAt: typeof record.updatedAt === 'number' ? record.updatedAt : now,
+  };
+}
+
+function positiveNumber(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function nonNegativeNumber(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.stones, db.designs, db.carves, db.impressions, db.catalogs], async () => {
-    await Promise.all([
-      db.stones.clear(),
-      db.designs.clear(),
-      db.carves.clear(),
-      db.impressions.clear(),
-      db.catalogs.clear(),
-    ]);
-  });
+  await db.transaction(
+    'rw',
+    [db.stones, db.designs, db.carves, db.impressions, db.catalogs, db.albumLayouts],
+    async () => {
+      await Promise.all([
+        db.stones.clear(),
+        db.designs.clear(),
+        db.carves.clear(),
+        db.impressions.clear(),
+        db.catalogs.clear(),
+        db.albumLayouts.clear(),
+      ]);
+    },
+  );
 }
 
 export async function importSnapshot(snapshot: SealCarveSnapshot): Promise<void> {
+  const albumLayouts = ensureAlbumLayoutInSnapshot(snapshot);
   await clearAllTables();
-  await db.transaction('rw', [db.stones, db.designs, db.carves, db.impressions, db.catalogs], async () => {
-    await db.stones.bulkPut(snapshot.stones);
-    await db.designs.bulkPut(snapshot.designs);
-    await db.carves.bulkPut(snapshot.carves);
-    await db.impressions.bulkPut(snapshot.impressions);
-    await db.catalogs.bulkPut(snapshot.catalogs);
-  });
+  await db.transaction(
+    'rw',
+    [db.stones, db.designs, db.carves, db.impressions, db.catalogs, db.albumLayouts],
+    async () => {
+      await db.stones.bulkPut(snapshot.stones);
+      await db.designs.bulkPut(snapshot.designs);
+      await db.carves.bulkPut(snapshot.carves);
+      await db.impressions.bulkPut(snapshot.impressions);
+      await db.catalogs.bulkPut(snapshot.catalogs);
+      await db.albumLayouts.bulkPut(albumLayouts);
+    },
+  );
 }
 
 export async function resetDatabase(): Promise<void> {
@@ -324,14 +429,15 @@ export async function resetDatabase(): Promise<void> {
 }
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [stones, designs, carves, impressions, catalogs] = await Promise.all([
+  const [stones, designs, carves, impressions, catalogs, albumLayouts] = await Promise.all([
     db.stones.count(),
     db.designs.count(),
     db.carves.count(),
     db.impressions.count(),
     db.catalogs.count(),
+    db.albumLayouts.count(),
   ]);
-  return { stones, designs, carves, impressions, catalogs };
+  return { stones, designs, carves, impressions, catalogs, albumLayouts };
 }
 
 /** 级联删除印石 → 印稿 → 工序 / 钤印 / 印谱条目 */
