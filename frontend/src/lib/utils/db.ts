@@ -1,8 +1,9 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
  * - 数据结构版本号与升级迁移逻辑（v1 初版；v2 为 impressions 增加 grade 索引、
- *   为 catalogs 增加 orderNo 索引，并回填历史记录缺失字段）
- * - 五张业务表的增删改查与整库导入导出
+ *   为 catalogs 增加 orderNo 索引，并回填历史记录缺失字段；
+ *   v3 新增 layouts 册页排布表）
+ * - 六张业务表的增删改查与整库导入导出
  * - 首次打开自动播种三层互相引用的演示数据（幂等）
  * 纯前端应用：不依赖任何后端服务或数据库。
  */
@@ -12,12 +13,14 @@ import type { Design } from '$lib/types/design';
 import type { Carve } from '$lib/types/carve';
 import type { Impression } from '$lib/types/impression';
 import type { Catalog } from '$lib/types/catalog';
+import { DEFAULT_LAYOUT_SETTINGS, type VolumeLayout } from '$lib/types/layout';
+import { buildLayoutEntries, computeLayout } from './layout';
 
 /** 数据库名（README 与导出文件均使用该名称） */
 export const DB_NAME = 'gbsealcarve';
 
 /** 当前数据结构版本号 */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** localStorage 侧少量元数据键 */
 export const LS_KEYS = {
@@ -85,6 +88,7 @@ class SealCarveDatabase extends Dexie {
   carves!: Table<Carve, string>;
   impressions!: Table<Impression, string>;
   catalogs!: Table<Catalog, string>;
+  layouts!: Table<VolumeLayout, string>;
 
   constructor() {
     super(DB_NAME);
@@ -131,6 +135,11 @@ class SealCarveDatabase extends Dexie {
             if (!catalog.included) catalog.included = 'pending';
           });
       });
+
+    // v3：新增册页排布表（既有数据由 ensureLayout() 在打开时补齐排布）
+    this.version(3).stores({
+      layouts: 'id, updatedAt',
+    });
   }
 }
 
@@ -149,6 +158,24 @@ export async function initDatabase(): Promise<void> {
   if ((await db.stones.count()) === 0) {
     await seedDatabase();
   }
+  await ensureLayout();
+}
+
+/**
+ * 册页排布缺失时先补齐再分册：
+ * 覆盖 v2→v3 升级、旧备份导入等「库中尚无排布信息」的场景，
+ * 按默认排布参数对当前已收录条目计算首版排布并落库。
+ */
+export async function ensureLayout(): Promise<void> {
+  if ((await db.layouts.count()) > 0) return;
+  const [catalogs, designs, stones] = await Promise.all([
+    db.catalogs.toArray(),
+    db.designs.toArray(),
+    db.stones.toArray(),
+  ]);
+  const entries = buildLayoutEntries(catalogs, designs, stones);
+  const initial = computeLayout(entries, DEFAULT_LAYOUT_SETTINGS, null, Date.now());
+  await db.layouts.put(initial);
 }
 
 /* ------------------------------ 播种数据 ------------------------------ */
@@ -261,15 +288,18 @@ export interface SealCarveSnapshot {
   carves: Carve[];
   impressions: Impression[];
   catalogs: Catalog[];
+  /** 册页排布（v3 起导出；旧备份可能缺失，导入时先补齐再分册） */
+  layouts?: VolumeLayout[];
 }
 
 export async function exportSnapshot(): Promise<SealCarveSnapshot> {
-  const [stones, designs, carves, impressions, catalogs] = await Promise.all([
+  const [stones, designs, carves, impressions, catalogs, layouts] = await Promise.all([
     db.stones.toArray(),
     db.designs.toArray(),
     db.carves.toArray(),
     db.impressions.toArray(),
     db.catalogs.toArray(),
+    db.layouts.toArray(),
   ]);
   return {
     app: DB_NAME,
@@ -280,10 +310,11 @@ export async function exportSnapshot(): Promise<SealCarveSnapshot> {
     carves,
     impressions,
     catalogs,
+    layouts,
   };
 }
 
-/** 校验导入文件结构，返回错误文案（空串表示通过） */
+/** 校验导入文件结构，返回错误文案（空串表示通过）；layouts 为可选，旧备份允许缺失 */
 export function validateSnapshot(input: unknown): string {
   if (typeof input !== 'object' || input === null) return '文件内容不是合法的 JSON 对象';
   const snapshot = input as Partial<SealCarveSnapshot>;
@@ -292,46 +323,55 @@ export function validateSnapshot(input: unknown): string {
   for (const key of keys) {
     if (!Array.isArray(snapshot[key])) return `备份文件缺少 ${String(key)} 集合`;
   }
+  if (snapshot.layouts !== undefined && !Array.isArray(snapshot.layouts)) return '备份文件的 layouts 集合格式不正确';
   return '';
 }
 
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.stones, db.designs, db.carves, db.impressions, db.catalogs], async () => {
+  await db.transaction('rw', [db.stones, db.designs, db.carves, db.impressions, db.catalogs, db.layouts], async () => {
     await Promise.all([
       db.stones.clear(),
       db.designs.clear(),
       db.carves.clear(),
       db.impressions.clear(),
       db.catalogs.clear(),
+      db.layouts.clear(),
     ]);
   });
 }
 
 export async function importSnapshot(snapshot: SealCarveSnapshot): Promise<void> {
   await clearAllTables();
-  await db.transaction('rw', [db.stones, db.designs, db.carves, db.impressions, db.catalogs], async () => {
+  await db.transaction('rw', [db.stones, db.designs, db.carves, db.impressions, db.catalogs, db.layouts], async () => {
     await db.stones.bulkPut(snapshot.stones);
     await db.designs.bulkPut(snapshot.designs);
     await db.carves.bulkPut(snapshot.carves);
     await db.impressions.bulkPut(snapshot.impressions);
     await db.catalogs.bulkPut(snapshot.catalogs);
+    if (Array.isArray(snapshot.layouts) && snapshot.layouts.length > 0) {
+      await db.layouts.bulkPut(snapshot.layouts);
+    }
   });
+  // 旧备份缺少排布信息：先按默认参数补齐首版排布，再供分册使用
+  await ensureLayout();
 }
 
 export async function resetDatabase(): Promise<void> {
   await clearAllTables();
   await seedDatabase();
+  await ensureLayout();
 }
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [stones, designs, carves, impressions, catalogs] = await Promise.all([
+  const [stones, designs, carves, impressions, catalogs, layouts] = await Promise.all([
     db.stones.count(),
     db.designs.count(),
     db.carves.count(),
     db.impressions.count(),
     db.catalogs.count(),
+    db.layouts.count(),
   ]);
-  return { stones, designs, carves, impressions, catalogs };
+  return { stones, designs, carves, impressions, catalogs, layouts };
 }
 
 /** 级联删除印石 → 印稿 → 工序 / 钤印 / 印谱条目 */

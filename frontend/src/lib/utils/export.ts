@@ -12,6 +12,7 @@ import { DESIGN_STYLE_LABEL, BORDER_STYLE_LABEL } from '$lib/types/design';
 import { GRADE_LABEL, PAPER_KIND_LABEL, PRESSURE_LABEL } from '$lib/types/impression';
 import { INCLUDED_LABEL } from '$lib/types/catalog';
 import { KNIFE_METHOD_LABEL, CARVE_STATE_LABEL } from '$lib/types/carve';
+import { PAPER_SIZES, type VolumeLayout } from '$lib/types/layout';
 import { describeSize } from './stone';
 import type { SealCarveSnapshot } from './db';
 
@@ -41,7 +42,7 @@ export function exportSnapshotJson(snapshot: SealCarveSnapshot): string {
   return filename;
 }
 
-/** 印谱 JSON 校验：检查 app 标识与各集合数组完整性 */
+/** 印谱 JSON 校验：检查 app 标识与各集合数组完整性（layouts 为可选，旧备份允许缺失） */
 export function validateSnapshot(input: unknown): string {
   if (typeof input !== 'object' || input === null) return '文件内容不是合法的 JSON 对象';
   const snapshot = input as Partial<SealCarveSnapshot>;
@@ -50,6 +51,7 @@ export function validateSnapshot(input: unknown): string {
   for (const key of keys) {
     if (!Array.isArray(snapshot[key])) return `备份文件缺少 ${String(key)} 集合`;
   }
+  if (snapshot.layouts !== undefined && !Array.isArray(snapshot.layouts)) return '备份文件的 layouts 集合格式不正确';
   return '';
 }
 
@@ -164,4 +166,88 @@ export async function copyText(text: string): Promise<boolean> {
     return false;
   }
   return false;
+}
+
+/* ------------------------------ 册页目录 ------------------------------ */
+
+/** 目录中的一行：页码 + 册号 + 条目信息 */
+export interface TocRow {
+  pageNo: number;
+  volumeNo: number;
+  catalogId: string;
+  sealText: string;
+  annotation: string;
+  stoneName: string;
+  proofread: boolean;
+}
+
+/** 由排布结果展开目录行（补白页不产生目录行） */
+export function buildTocRows(layout: VolumeLayout, catalogs: Catalog[], designs: Design[], stones: Stone[]): TocRow[] {
+  const rows: TocRow[] = [];
+  for (const page of layout.pages) {
+    if (page.kind !== 'content') continue;
+    for (const catalogId of page.entryIds) {
+      const catalog = catalogs.find((item) => item.id === catalogId);
+      const design = designs.find((item) => item.id === catalog?.designId);
+      const stone = stones.find((item) => item.id === catalog?.stoneId);
+      rows.push({
+        pageNo: page.pageNo,
+        volumeNo: page.volumeNo,
+        catalogId,
+        sealText: design?.sealText ?? '（印稿已删除）',
+        annotation: design?.annotation ?? '',
+        stoneName: stone?.name ?? '（印石已删除）',
+        proofread: page.proofread,
+      });
+    }
+  }
+  return rows;
+}
+
+/** 册页目录文本：按册展开页码与印文，附排布参数与总册数 */
+export function buildTocText(layout: VolumeLayout, catalogs: Catalog[], designs: Design[], stones: Stone[]): string {
+  const paper = PAPER_SIZES[layout.settings.paperSize];
+  const { margins } = layout.settings;
+  const lines: string[] = [
+    '篆刻印谱目录（册页排布）',
+    `纸张：${paper.label}（${paper.widthMm}×${paper.heightMm}mm）　页边距：上${margins.top} 下${margins.bottom} 左${margins.left} 右${margins.right}mm　每册 ${layout.settings.pagesPerVolume} 页`,
+    `生成时间：${new Date().toLocaleString('zh-CN')}`,
+    '',
+  ];
+  const rows = buildTocRows(layout, catalogs, designs, stones);
+  if (rows.length === 0) {
+    lines.push('尚无已收录条目，印谱未分册。');
+    return lines.join('\n');
+  }
+  let volumeNo = 0;
+  for (const row of rows) {
+    if (row.volumeNo !== volumeNo) {
+      volumeNo = row.volumeNo;
+      lines.push(`第${CHINESE_NUM[volumeNo] ?? String(volumeNo)}册`);
+    }
+    lines.push(`　第 ${row.pageNo} 页　${row.sealText}（${row.annotation || '无释文'}）　${row.stoneName}`);
+  }
+  lines.push('');
+  lines.push(`合计 ${rows.length} 方 · ${layout.totalPages} 页 · ${layout.totalVolumes} 册。`);
+  return lines.join('\n');
+}
+
+const CHINESE_NUM: Record<number, string> = {
+  1: '一',
+  2: '二',
+  3: '三',
+  4: '四',
+  5: '五',
+  6: '六',
+  7: '七',
+  8: '八',
+  9: '九',
+  10: '十',
+};
+
+/** 导出册页目录为文本文件 */
+export function exportTocText(layout: VolumeLayout, catalogs: Catalog[], designs: Design[], stones: Stone[]): string {
+  const filename = `篆刻印谱目录-${stampSuffix()}.txt`;
+  download(filename, buildTocText(layout, catalogs, designs, stones), 'text/plain;charset=utf-8');
+  return filename;
 }

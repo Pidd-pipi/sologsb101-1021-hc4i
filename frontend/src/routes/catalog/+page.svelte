@@ -12,6 +12,7 @@
   import { carves, loadCarves } from '$lib/stores/carveStore';
   import { impressions, loadImpressions, bestImpressionOf } from '$lib/stores/impressionStore';
   import { loadStones, stones } from '$lib/stores/stoneStore';
+  import { reloadLayout } from '$lib/stores/layoutStore';
   import {
     INCLUDED_COLOR,
     INCLUDED_OPTIONS,
@@ -179,15 +180,17 @@
       return;
     }
     if (!window.confirm('导入会清空当前浏览器中的全部档案，再写入备份内容，操作不可撤销。是否继续？')) return;
-    await importSnapshot(parsed as SealCarveSnapshot);
-    await Promise.all([loadStones(), loadDesigns(), loadCarves(), loadImpressions(), catalogTable.refresh()]);
-    showToast('导入完成，数据已覆盖');
+    const snapshot = parsed as SealCarveSnapshot;
+    const hadLayout = Array.isArray(snapshot.layouts) && snapshot.layouts.length > 0;
+    await importSnapshot(snapshot);
+    await Promise.all([loadStones(), loadDesigns(), loadCarves(), loadImpressions(), catalogTable.refresh(), reloadLayout()]);
+    showToast(hadLayout ? '导入完成，数据已覆盖' : '导入完成：旧备份缺少排布信息，已按默认参数补齐并分册');
   }
 
   async function handleReset(): Promise<void> {
     if (!window.confirm('会删除当前浏览器中的全部档案并恢复演示数据，不可撤销。是否继续？')) return;
     await resetDatabase();
-    await Promise.all([loadStones(), loadDesigns(), loadCarves(), loadImpressions(), catalogTable.refresh()]);
+    await Promise.all([loadStones(), loadDesigns(), loadCarves(), loadImpressions(), catalogTable.refresh(), reloadLayout()]);
     showToast('已清空并重新载入演示数据');
   }
 </script>
@@ -337,7 +340,7 @@
     <section class="gb-panel space-y-3">
       <h3 class="text-base text-ink">整库导出</h3>
       <p class="text-sm text-ink-soft">
-        导出文件包含 5 张业务表全量数据与结构版本号（v{DB_VERSION}），可在其他设备通过「导入 JSON」还原。
+        导出文件包含 6 张业务表全量数据（含册页排布）与结构版本号（v{DB_VERSION}），可在其他设备通过「导入 JSON」还原；旧版备份缺少排布信息时，导入后会按默认参数先补齐再分册。
       </p>
       <div class="flex flex-wrap gap-2">
         <button class="gb-btn" onclick={() => void handleExport()}>JSON 备份</button>

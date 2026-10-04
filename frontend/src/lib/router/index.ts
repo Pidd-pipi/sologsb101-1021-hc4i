@@ -10,13 +10,14 @@
 export { installRouter, navigate, normalizePath, push, replace, resolveRoute, router } from './router.svelte';
 export type { InstallOptions, RouteMap, RouterState } from './router.svelte';
 
-/** 五个模块路径（与需求逐字一致） */
+/** 六个模块路径 */
 export const ROUTES = {
   stones: '/stones',
   designs: '/designs',
   carve: '/carve',
   impressions: '/impressions',
-  catalog: '/catalog'
+  catalog: '/catalog',
+  volumes: '/volumes'
 } as const;
 
 /** 根路径规范化后的默认模块 */
@@ -34,7 +35,8 @@ export const NAV_ITEMS: NavItem[] = [
   { path: ROUTES.designs, label: '印稿设计', desc: '朱白文 · 边框 · 采用稿' },
   { path: ROUTES.carve, label: '刻制工序', desc: '刀法排序 · 完成回写' },
   { path: ROUTES.impressions, label: '钤印记录', desc: '印泥 · 压力 · 评级' },
-  { path: ROUTES.catalog, label: '印谱汇总', desc: '排序 · 收录 · 导出' }
+  { path: ROUTES.catalog, label: '印谱汇总', desc: '排序 · 收录 · 导出' },
+  { path: ROUTES.volumes, label: '册页排布', desc: '纸张 · 边距 · 续册' }
 ];
 
 /** 已注册的路径（用于判断当前路径是否合法） */
